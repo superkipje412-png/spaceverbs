@@ -1,0 +1,12 @@
+{
+  "name": "spaceverbs",
+  "version": "1.0.0",
+  "description": "SpaceVerbs: werkwoordspelling oefenen voor de basisschool, met planeten, munten, sterren en een aliendierentuin.",
+  "main": "server.js",
+  "private": true,
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server.js",
+    "vragen": "node scripts/maak-vragen.js"
+  }
+}

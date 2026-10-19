@@ -56,7 +56,9 @@ function sessie(req) {
 function nieuweSessie(res, soort, id) {
   const token = crypto.randomBytes(32).toString('hex');
   db.prepare('INSERT INTO sessies (token, soort, gebruiker_id) VALUES (?, ?, ?)').run(token, soort, id);
-  res.setHeader('Set-Cookie', `sv=${token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${60 * 60 * 24 * 180}`);
+  // Online (achter https) krijgt het inlogkoekje ook de Secure-vlag
+  const veilig = res.req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+  res.setHeader('Set-Cookie', `sv=${token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${60 * 60 * 24 * 180}${veilig}`);
 }
 
 // Eenvoudige rem op inlogpogingen per IP

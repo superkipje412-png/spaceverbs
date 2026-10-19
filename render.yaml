@@ -1,0 +1,19 @@
+# Instellingen voor Render.com (New → Blueprint). De database staat op een blijvende schijf.
+services:
+  - type: web
+    name: spaceverbs
+    runtime: node
+    plan: starter
+    region: frankfurt
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/ik
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: DATA_DIR
+        value: /var/data
+    disk:
+      name: spaceverbs-data
+      mountPath: /var/data
+      sizeGB: 1

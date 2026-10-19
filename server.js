@@ -89,17 +89,37 @@ function gedaanPerPlaneet(leerlingId) {
   for (const r of rijen) uit[r.planeet] = r.n;
   return uit;
 }
+const lesActief = groep => !!groep.les_tot && groep.les_tot > nu();
 function dierentuin(groep) {
   const per = groep.minuten_per_dier * 60;
   const aantal = Math.min(SPEL.DIEREN.length, Math.floor(groep.dierentuin_sec / per));
   return {
     per_dier_min: groep.minuten_per_dier, sec: groep.dierentuin_sec, ontgrendeld: aantal, totaal: SPEL.DIEREN.length,
     naar_volgende: aantal >= SPEL.DIEREN.length ? 1 : (groep.dierentuin_sec % per) / per,
-    min_tot_volgende: aantal >= SPEL.DIEREN.length ? 0 : Math.ceil((per - (groep.dierentuin_sec % per)) / 60)
+    min_tot_volgende: aantal >= SPEL.DIEREN.length ? 0 : Math.ceil((per - (groep.dierentuin_sec % per)) / 60),
+    les_actief: lesActief(groep), les_tot: lesActief(groep) ? groep.les_tot : null
   };
 }
 function blobVan(l) {
-  try { return JSON.parse(l.blob); } catch { return null; }
+  let b;
+  try { b = JSON.parse(l.blob); } catch { return null; }
+  if (!b) return null;
+  // oude blobs hadden één accessoire, nu kan een blob alles tegelijk dragen
+  if (!Array.isArray(b.accessoires)) b.accessoires = b.accessoire && b.accessoire !== 'geen' ? [b.accessoire] : [];
+  delete b.accessoire;
+  return b;
+}
+// Hoogste planeet waarop de leerling mag oefenen (tijdens een herhalingsster blijft de volgende planeet dicht).
+const hoogstePlaneet = l => (l.herhaling ?? l.planeet);
+// Gemengde vragen uit alle planeten t/m planeet k, eerlijk verdeeld.
+function gemengd(k, n) {
+  const stapels = PER_PLANEET.slice(0, k + 1).map(schud);
+  const uit = [];
+  for (let i = 0; uit.length < n; i++) {
+    const stapel = stapels[i % stapels.length];
+    if (stapel.length) uit.push(stapel.pop());
+  }
+  return schud(uit);
 }
 function vraagVoorLeerling(v) {
   const { id, type, zin, ww, opties, hoofdletter, planeet } = v;
@@ -109,13 +129,19 @@ function leerlingStatus(l) {
   const gedaan = gedaanPerPlaneet(l.id);
   const groep = db.prepare('SELECT * FROM groepen WHERE id = ?').get(l.groep_id);
   return {
-    leerling: { id: l.id, naam: l.naam, munten: l.munten, planeet: l.planeet, reeks: l.reeks, blob: blobVan(l), oefen_min: Math.round(l.oefen_sec / 60) },
+    leerling: { id: l.id, naam: l.naam, munten: l.munten, planeet: l.planeet, herhaling: l.herhaling, reeks: l.reeks, blob: blobVan(l), oefen_min: Math.round(l.oefen_sec / 60) },
     groep: { naam: groep.naam },
     planeten: PLANETEN.map((p, i) => ({
       ...p, gedaan: gedaan[i], totaal: AANTAL(i),
-      status: i < l.planeet ? 'klaar' : i === l.planeet ? 'huidig' : 'slot',
-      toets_open: i === l.planeet && gedaan[i] >= AANTAL(i)
+      status: i < l.planeet ? 'klaar' : i === l.planeet && l.herhaling === null ? 'huidig' : 'slot',
+      toets_open: i === l.planeet && l.herhaling === null && gedaan[i] >= AANTAL(i)
     })),
+    // herhalingssterren: ster k ligt tussen planeet k en planeet k + 1
+    sterren: PLANETEN.slice(0, -1).map((_, k) => ({
+      nr: k, na: PLANETEN[k].naam, voor: PLANETEN[k + 1].naam,
+      status: l.herhaling === k ? 'huidig' : k < l.planeet - 1 || (k === l.planeet - 1 && l.herhaling === null) ? 'klaar' : 'slot'
+    })),
+    herhaling: { aantal: SPEL.HERHALING_AANTAL, nodig: SPEL.HERHALING_NODIG },
     dierentuin: dierentuin(groep),
     accessoires: SPEL.ACCESSOIRES.map(a => ({ ...a, open: a.planeet < l.planeet }))
   };
@@ -127,6 +153,8 @@ function telTijd(l, sec) {
   const groep = db.prepare('SELECT * FROM groepen WHERE id = ?').get(l.groep_id);
   const voor = dierentuin(groep).ontgrendeld;
   db.prepare('UPDATE leerlingen SET oefen_sec = oefen_sec + ?, laatst_actief = ? WHERE id = ?').run(sec, nu(), l.id);
+  // De dierentuin groeit alleen tijdens een oefenles die de leerkracht heeft aangezet (dus niet thuis).
+  if (!lesActief(groep)) return null;
   db.prepare('UPDATE groepen SET dierentuin_sec = dierentuin_sec + ? WHERE id = ?').run(sec, groep.id);
   const na = dierentuin({ ...groep, dierentuin_sec: groep.dierentuin_sec + sec }).ontgrendeld;
   return na > voor ? SPEL.DIEREN[na - 1] : null;
@@ -146,10 +174,20 @@ route('POST', '/api/leerkracht/registreer', null, ({ body, res }) => {
   if (!naam || !/^\S+@\S+\.\S+$/.test(email)) throw new Fout(400, 'Vul je naam en een geldig e-mailadres in.');
   if (ww.length < 8) throw new Fout(400, 'Kies een wachtwoord van minimaal 8 tekens.');
   if (db.prepare('SELECT 1 FROM leerkrachten WHERE email = ?').get(email)) throw new Fout(400, 'Dit e-mailadres heeft al een account.');
-  const { lastInsertRowid } = db.prepare('INSERT INTO leerkrachten (naam, email, wachtwoord) VALUES (?, ?, ?)').run(naam, email, hash(ww));
+  // De allereerste leerkracht wordt beheerder. Daarna kan alleen iemand met een uitnodigingscode een account maken.
+  const eerste = !db.prepare('SELECT 1 FROM leerkrachten').get();
+  let uitnodiging = null;
+  if (!eerste) {
+    const code = String(body.code || '').trim().toUpperCase();
+    uitnodiging = db.prepare('SELECT * FROM uitnodigingen WHERE code = ? AND gebruikt_door IS NULL AND verloopt > ?').get(code, nu());
+    if (!uitnodiging) throw new Fout(400, 'Deze uitnodigingscode klopt niet of is verlopen. Vraag de beheerder van SpaceVerbs om een nieuwe code.');
+  }
+  const { lastInsertRowid } = db.prepare('INSERT INTO leerkrachten (naam, email, wachtwoord, beheerder) VALUES (?, ?, ?, ?)').run(naam, email, hash(ww), eerste ? 1 : 0);
+  if (uitnodiging) db.prepare('UPDATE uitnodigingen SET gebruikt_door = ? WHERE code = ?').run(Number(lastInsertRowid), uitnodiging.code);
   nieuweSessie(res, 'leerkracht', Number(lastInsertRowid));
   return { ok: true };
 });
+route('GET', '/api/leerkracht/eerste', null, () => ({ eerste: !db.prepare('SELECT 1 FROM leerkrachten').get() }));
 route('POST', '/api/leerkracht/login', null, ({ body, res, req }) => {
   remInlog(req);
   const lk = db.prepare('SELECT * FROM leerkrachten WHERE email = ?').get(norm(body.email));
@@ -174,7 +212,7 @@ route('GET', '/api/ik', null, ({ req }) => {
   const s = sessie(req);
   if (!s) return { rol: null };
   if (s.soort === 'leerkracht') {
-    const lk = db.prepare('SELECT id, naam, email FROM leerkrachten WHERE id = ?').get(s.gebruiker_id);
+    const lk = db.prepare('SELECT id, naam, email, beheerder FROM leerkrachten WHERE id = ?').get(s.gebruiker_id);
     return lk ? { rol: 'leerkracht', leerkracht: lk } : { rol: null };
   }
   const l = db.prepare('SELECT id, naam FROM leerlingen WHERE id = ?').get(s.gebruiker_id);
@@ -188,19 +226,26 @@ route('POST', '/api/blob', 'leerling', ({ l, body }) => {
   const kleuren = ['#22c55e', '#3b82f6', '#a855f7', '#ec4899', '#f97316', '#facc15', '#06b6d4', '#ef4444'];
   const kleur = kleuren.includes(body.kleur) ? body.kleur : kleuren[0];
   const ogen = [1, 2, 3].includes(Number(body.ogen)) ? Number(body.ogen) : 2;
-  const acc = SPEL.ACCESSOIRES.find(a => a.id === body.accessoire && a.planeet < l.planeet) ? body.accessoire : 'geen';
+  const gekozen = Array.isArray(body.accessoires) ? body.accessoires : [];
+  const accessoires = SPEL.ACCESSOIRES.filter(a => a.id !== 'geen' && a.planeet < l.planeet && gekozen.includes(a.id)).map(a => a.id);
   const naam = String(body.naam || '').trim().slice(0, 20) || 'Blobbie';
-  db.prepare('UPDATE leerlingen SET blob = ? WHERE id = ?').run(JSON.stringify({ kleur, ogen, accessoire: acc, naam }), l.id);
+  db.prepare('UPDATE leerlingen SET blob = ? WHERE id = ?').run(JSON.stringify({ kleur, ogen, accessoires, naam }), l.id);
   return { ok: true };
 });
 
 function magPlaneet(l, p) {
   p = Number(p);
-  if (!Number.isInteger(p) || p < 0 || p >= PLANETEN.length || p > l.planeet) throw new Fout(403, 'Deze planeet is nog op slot.');
+  if (!Number.isInteger(p) || p < 0 || p >= PLANETEN.length || p > hoogstePlaneet(l)) throw new Fout(403, 'Deze planeet is nog op slot.');
   return p;
 }
 
 route('GET', '/api/oefenen', 'leerling', ({ l, query }) => {
+  if (query.ster !== undefined) {
+    // oefenen voor een herhalingsster: gemengde vragen uit alle planeten tot nu toe
+    const k = magPlaneet(l, query.ster);
+    if (k >= PLANETEN.length - 1 || (k === hoogstePlaneet(l) && l.herhaling === null)) throw new Fout(403, 'Deze herhalingsster is nog op slot.');
+    return { ster: k, vragen: gemengd(k, 10).map(vraagVoorLeerling) };
+  }
   const p = magPlaneet(l, query.planeet);
   const goed = new Set(db.prepare('SELECT vraag_id FROM voortgang WHERE leerling_id = ? AND planeet = ? AND goed > 0').all(l.id, p).map(r => r.vraag_id));
   const open = schud(PER_PLANEET[p].filter(v => !goed.has(v.id)));
@@ -242,12 +287,21 @@ route('POST', '/api/antwoord', 'leerling', ({ l, body }) => {
 
 route('POST', '/api/toets/start', 'leerling', ({ l, body }) => {
   const p = magPlaneet(l, body.planeet);
-  if (p !== l.planeet) throw new Fout(400, 'Deze planeet heb je al gehaald!');
+  if (p !== l.planeet || l.herhaling !== null) throw new Fout(400, 'Deze toets kun je nu niet doen.');
   if (gedaanPerPlaneet(l.id)[p] < AANTAL(p)) throw new Fout(400, 'Maak eerst alle vragen van deze planeet goed.');
   const vragen = schud(PER_PLANEET[p]).slice(0, SPEL.TOETS_AANTAL);
   const { lastInsertRowid } = db.prepare('INSERT INTO toetsen (leerling_id, planeet, vragen) VALUES (?, ?, ?)')
     .run(l.id, p, JSON.stringify(vragen.map(v => v.id)));
   return { toets_id: Number(lastInsertRowid), vragen: vragen.map(vraagVoorLeerling) };
+});
+
+route('POST', '/api/ster/start', 'leerling', ({ l, body }) => {
+  const k = Number(body.ster);
+  if (l.herhaling === null || k !== l.herhaling) throw new Fout(400, 'Deze herhalingsster kun je nu niet doen.');
+  const vragen = gemengd(k, SPEL.HERHALING_AANTAL);
+  const { lastInsertRowid } = db.prepare("INSERT INTO toetsen (leerling_id, planeet, vragen, soort) VALUES (?, ?, ?, 'ster')")
+    .run(l.id, k, JSON.stringify(vragen.map(v => v.id)));
+  return { toets_id: Number(lastInsertRowid), vragen: vragen.map(vraagVoorLeerling), nodig: SPEL.HERHALING_NODIG };
 });
 
 route('POST', '/api/toets/antwoord', 'leerling', ({ l, body }) => {
@@ -270,17 +324,27 @@ route('POST', '/api/toets/antwoord', 'leerling', ({ l, body }) => {
     return { klaar: false, nieuwDier };
   }
   const score = antwoorden.filter(a => a.goed).length;
-  const gehaald = score === ids.length;
+  const ster = t.soort === 'ster';
+  const nodig = ster ? SPEL.HERHALING_NODIG : ids.length;
+  const gehaald = score >= nodig;
   db.prepare('UPDATE toetsen SET antwoorden = ?, score = ?, gehaald = ?, klaar = ? WHERE id = ?')
     .run(JSON.stringify(antwoorden), score, gehaald ? 1 : 0, nu(), t.id);
-  let verdiend = 0;
-  if (gehaald && t.planeet === l.planeet) {
+  let verdiend = 0, accessoire = null, herhalingsster = false;
+  if (gehaald && ster && l.herhaling === t.planeet) {
+    verdiend = SPEL.MUNTEN.herhalingsster;
+    db.prepare('UPDATE leerlingen SET herhaling = NULL, munten = munten + ? WHERE id = ?').run(verdiend, l.id);
+  } else if (gehaald && !ster && t.planeet === l.planeet && l.herhaling === null) {
     verdiend = SPEL.MUNTEN.toets;
-    db.prepare('UPDATE leerlingen SET planeet = planeet + 1, munten = munten + ? WHERE id = ?').run(verdiend, l.id);
+    // na elke planeet (behalve de laatste) volgt eerst een herhalingsster
+    herhalingsster = t.planeet < PLANETEN.length - 1;
+    accessoire = SPEL.ACCESSOIRES.find(a => a.planeet === t.planeet) || null;
+    const blob = blobVan(l);
+    if (blob && accessoire && !blob.accessoires.includes(accessoire.id)) blob.accessoires.push(accessoire.id); // meteen aantrekken
+    db.prepare('UPDATE leerlingen SET planeet = planeet + 1, herhaling = ?, munten = munten + ?, blob = ? WHERE id = ?')
+      .run(herhalingsster ? t.planeet : null, verdiend, blob ? JSON.stringify(blob) : l.blob, l.id);
   }
   return {
-    klaar: true, score, totaal: ids.length, gehaald, verdiend, nieuwDier,
-    accessoire: gehaald ? SPEL.ACCESSOIRES.find(a => a.planeet === t.planeet) : null,
+    klaar: true, score, totaal: ids.length, nodig, gehaald, verdiend, nieuwDier, ster, herhalingsster, accessoire,
     nakijken: antwoorden.map(a => { const v = VRAAG.get(a.id); return { zin: v.zin, ww: v.ww, antwoord: a.antwoord, goed: a.goed, juist: v.antwoord, uitleg: v.uitleg, hoofdletter: !!v.hoofdletter }; })
   };
 });
@@ -332,8 +396,8 @@ function mijnLeerling(lk, id) {
 }
 
 route('GET', '/api/lk/groepen', 'leerkracht', ({ lk }) => ({
-  leerkracht: { naam: lk.naam, email: lk.email },
-  groepen: db.prepare(`SELECT g.id, g.naam, g.minuten_per_dier, g.dierentuin_sec, COUNT(l.id) AS leerlingen
+  leerkracht: { naam: lk.naam, email: lk.email, beheerder: !!lk.beheerder },
+  groepen: db.prepare(`SELECT g.id, g.naam, g.minuten_per_dier, g.dierentuin_sec, g.les_tot, COUNT(l.id) AS leerlingen
     FROM groepen g LEFT JOIN leerlingen l ON l.groep_id = g.id WHERE g.leerkracht_id = ? GROUP BY g.id ORDER BY g.naam`).all(lk.id)
     .map(g => ({ ...g, dierentuin: dierentuin(g) }))
 }));
@@ -350,6 +414,14 @@ route('PATCH', '/api/lk/groepen/:id', 'leerkracht', ({ lk, body, params }) => {
   db.prepare('UPDATE groepen SET naam = ?, minuten_per_dier = ? WHERE id = ?').run(naam, min, g.id);
   return { ok: true };
 });
+route('POST', '/api/lk/groepen/:id/les', 'leerkracht', ({ lk, body, params }) => {
+  const g = mijnGroep(lk, params.id);
+  const min = Math.round(Number(body.minuten) || 0);
+  if (min < 0 || min > 240) throw new Fout(400, 'Kies een lesduur tussen 1 en 240 minuten.');
+  const tot = min ? new Date(Date.now() + min * 60_000).toISOString() : null; // 0 = les stoppen
+  db.prepare('UPDATE groepen SET les_tot = ? WHERE id = ?').run(tot, g.id);
+  return { les_tot: tot };
+});
 route('DELETE', '/api/lk/groepen/:id', 'leerkracht', ({ lk, params }) => {
   const g = mijnGroep(lk, params.id);
   db.prepare('DELETE FROM groepen WHERE id = ?').run(g.id);
@@ -364,7 +436,7 @@ route('GET', '/api/lk/groepen/:id', 'leerkracht', ({ lk, params }) => {
     const top = db.prepare(`SELECT categorie, COUNT(*) AS n FROM pogingen WHERE leerling_id = ? AND goed = 0
       GROUP BY categorie ORDER BY n DESC LIMIT 1`).get(l.id);
     return {
-      id: l.id, naam: l.naam, gebruikersnaam: l.gebruikersnaam, wachtwoord: l.wachtwoord, planeet: l.planeet,
+      id: l.id, naam: l.naam, gebruikersnaam: l.gebruikersnaam, wachtwoord: l.wachtwoord, planeet: l.planeet, herhaling: l.herhaling,
       gedaan: l.planeet < PLANETEN.length ? gedaan[l.planeet] : null, munten: l.munten,
       oefen_min: Math.round(l.oefen_sec / 60), laatst_actief: l.laatst_actief, pogingen: p.n,
       percentage_goed: p.n ? Math.round((p.g / p.n) * 100) : null,
@@ -404,11 +476,12 @@ route('GET', '/api/lk/leerlingen/:id', 'leerkracht', ({ lk, params }) => {
     .map(r => ({ ...r, label: CATEGORIEEN[r.categorie] || r.categorie }));
   const recent = db.prepare('SELECT * FROM pogingen WHERE leerling_id = ? AND goed = 0 ORDER BY id DESC LIMIT 40').all(l.id)
     .map(r => { const v = VRAAG.get(r.vraag_id); return { zin: v.zin, ww: v.ww, antwoord: r.antwoord, juist: v.antwoord, label: CATEGORIEEN[r.categorie], modus: r.modus, tijd: r.tijd, planeet: v.planeet }; });
-  const toetsen = db.prepare('SELECT planeet, score, gehaald, klaar FROM toetsen WHERE leerling_id = ? AND klaar IS NOT NULL ORDER BY id DESC').all(l.id)
-    .map(t => ({ ...t, naam: PLANETEN[t.planeet].naam }));
+  const toetsen = db.prepare('SELECT planeet, soort, score, gehaald, klaar, vragen FROM toetsen WHERE leerling_id = ? AND klaar IS NOT NULL ORDER BY id DESC').all(l.id)
+    .map(t => ({ planeet: t.planeet, soort: t.soort, score: t.score, gehaald: t.gehaald, klaar: t.klaar, totaal: JSON.parse(t.vragen).length,
+      naam: t.soort === 'ster' ? `⭐ Herhalingsster na ${PLANETEN[t.planeet].naam}` : PLANETEN[t.planeet].naam }));
   const sterren = db.prepare('SELECT COUNT(*) AS n FROM sterren WHERE leerling_id = ?').get(l.id).n;
   return {
-    leerling: { id: l.id, naam: l.naam, gebruikersnaam: l.gebruikersnaam, wachtwoord: l.wachtwoord, planeet: l.planeet, munten: l.munten,
+    leerling: { id: l.id, naam: l.naam, gebruikersnaam: l.gebruikersnaam, wachtwoord: l.wachtwoord, planeet: l.planeet, herhaling: l.herhaling, munten: l.munten,
       oefen_min: Math.round(l.oefen_sec / 60), laatst_actief: l.laatst_actief, blob: blobVan(l), groep_id: l.groep_id, sterren },
     perPlaneet, fouten, recent, toetsen
   };
@@ -416,14 +489,18 @@ route('GET', '/api/lk/leerlingen/:id', 'leerkracht', ({ lk, params }) => {
 route('PATCH', '/api/lk/leerlingen/:id', 'leerkracht', ({ lk, body, params }) => {
   const l = mijnLeerling(lk, params.id);
   const naam = body.naam !== undefined ? String(body.naam).trim().slice(0, 40) || l.naam : l.naam;
-  let planeet = l.planeet;
-  if (body.planeet !== undefined) {
-    planeet = Number(body.planeet);
-    if (!Number.isInteger(planeet) || planeet < 0 || planeet > PLANETEN.length) throw new Fout(400, 'Ongeldige planeet');
+  // stap: 'p3' = op planeet 3, 's2' = bij de herhalingsster na planeet 2
+  let planeet = l.planeet, herhaling = l.herhaling;
+  if (body.stap !== undefined) {
+    const m = /^([ps])(\d+)$/.exec(String(body.stap));
+    const n = m ? Number(m[2]) : -1;
+    if (m && m[1] === 'p' && n >= 0 && n <= PLANETEN.length) { planeet = n; herhaling = null; }
+    else if (m && m[1] === 's' && n >= 0 && n < PLANETEN.length - 1) { planeet = n + 1; herhaling = n; }
+    else throw new Fout(400, 'Ongeldige planeet');
   }
   let groep = l.groep_id;
   if (body.groep_id !== undefined) groep = mijnGroep(lk, body.groep_id).id;
-  db.prepare('UPDATE leerlingen SET naam = ?, planeet = ?, groep_id = ? WHERE id = ?').run(naam, planeet, groep, l.id);
+  db.prepare('UPDATE leerlingen SET naam = ?, planeet = ?, herhaling = ?, groep_id = ? WHERE id = ?').run(naam, planeet, herhaling, groep, l.id);
   return { ok: true };
 });
 route('POST', '/api/lk/leerlingen/:id/nieuw-wachtwoord', 'leerkracht', ({ lk, params }) => {
@@ -437,6 +514,48 @@ route('DELETE', '/api/lk/leerlingen/:id', 'leerkracht', ({ lk, params }) => {
   const l = mijnLeerling(lk, params.id);
   db.prepare('DELETE FROM leerlingen WHERE id = ?').run(l.id);
   db.prepare("DELETE FROM sessies WHERE soort = 'leerling' AND gebruiker_id = ?").run(l.id);
+  return { ok: true };
+});
+
+// --- collega's (alleen beheerder) ---
+function alleenBeheerder(lk) { if (!lk.beheerder) throw new Fout(403, 'Alleen de beheerder kan dit doen.'); }
+const CODETEKENS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const maakCode = () => 'SV-' + Array.from({ length: 6 }, () => CODETEKENS[crypto.randomInt(CODETEKENS.length)]).join('');
+
+route('GET', '/api/lk/collegas', 'leerkracht', ({ lk }) => {
+  alleenBeheerder(lk);
+  return {
+    collegas: db.prepare(`SELECT k.id, k.naam, k.email, k.beheerder, k.gemaakt, COUNT(g.id) AS groepen
+      FROM leerkrachten k LEFT JOIN groepen g ON g.leerkracht_id = k.id GROUP BY k.id ORDER BY k.naam`).all()
+      .map(k => ({ ...k, beheerder: !!k.beheerder, ik: k.id === lk.id })),
+    uitnodigingen: db.prepare('SELECT code, naam, verloopt FROM uitnodigingen WHERE gebruikt_door IS NULL AND verloopt > ? ORDER BY gemaakt DESC').all(nu())
+  };
+});
+route('POST', '/api/lk/uitnodigingen', 'leerkracht', ({ lk, body }) => {
+  alleenBeheerder(lk);
+  const code = maakCode();
+  const verloopt = new Date(Date.now() + 14 * 24 * 3600_000).toISOString();
+  db.prepare('INSERT INTO uitnodigingen (code, gemaakt_door, naam, verloopt) VALUES (?, ?, ?, ?)').run(code, lk.id, String(body.naam || '').trim().slice(0, 60), verloopt);
+  return { code, verloopt };
+});
+route('DELETE', '/api/lk/uitnodigingen/:code', 'leerkracht', ({ lk, params }) => {
+  alleenBeheerder(lk);
+  db.prepare('DELETE FROM uitnodigingen WHERE code = ?').run(params.code);
+  return { ok: true };
+});
+route('PATCH', '/api/lk/collegas/:id', 'leerkracht', ({ lk, body, params }) => {
+  alleenBeheerder(lk);
+  const id = Number(params.id);
+  if (id === lk.id) throw new Fout(400, 'Je kunt je eigen beheerdersrol niet weghalen.');
+  db.prepare('UPDATE leerkrachten SET beheerder = ? WHERE id = ?').run(body.beheerder ? 1 : 0, id);
+  return { ok: true };
+});
+route('DELETE', '/api/lk/collegas/:id', 'leerkracht', ({ lk, params }) => {
+  alleenBeheerder(lk);
+  const id = Number(params.id);
+  if (id === lk.id) throw new Fout(400, 'Je kunt je eigen account niet verwijderen.');
+  db.prepare('DELETE FROM leerkrachten WHERE id = ?').run(id); // groepen en leerlingen gaan mee
+  db.prepare("DELETE FROM sessies WHERE soort = 'leerkracht' AND gebruiker_id = ?").run(id);
   return { ok: true };
 });
 

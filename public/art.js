@@ -40,7 +40,8 @@ function planeetSVG(p, grootte = 120, opSlot = false) {
 }
 
 function blobSVG(blob, grootte = 120) {
-  const b = blob || { kleur: '#22c55e', ogen: 2, accessoire: 'geen' };
+  const b = blob || { kleur: '#22c55e', ogen: 2, accessoires: [] };
+  const draagt = new Set(Array.isArray(b.accessoires) ? b.accessoires : b.accessoire ? [b.accessoire] : []);
   const k = b.kleur;
   const ogen = { 1: [[50, 46, 11]], 2: [[39, 46, 8], [61, 46, 8]], 3: [[34, 48, 7], [50, 40, 7], [66, 48, 7]] }[b.ogen] || [[39, 46, 8], [61, 46, 8]];
   const oog = ([x, y, r]) => `<circle cx="${x}" cy="${y}" r="${r}" fill="#fff"/><circle cx="${x + r * .25}" cy="${y + r * .15}" r="${r * .5}" fill="#1e1b4b"/><circle cx="${x + r * .45}" cy="${y - r * .2}" r="${r * .18}" fill="#fff"/>`;
@@ -55,8 +56,10 @@ function blobSVG(blob, grootte = 120) {
     ster: `<path d="M88 30 L88 84" stroke="#a16207" stroke-width="3"/><path d="M88 16 l4 9 10 1 -7 7 2 10 -9 -5 -9 5 2 -10 -7 -7 10 -1z" fill="#facc15"/>`,
     kroon: `<path d="M32 22 L36 6 L44 16 L50 2 L56 16 L64 6 L68 22z" fill="#facc15" stroke="#ca8a04" stroke-width="2"/><circle cx="50" cy="14" r="2.5" fill="#ef4444"/>`
   };
-  const achter = ['cape', 'jetpack'].includes(b.accessoire) ? acc[b.accessoire] : '';
-  const voor = !['cape', 'jetpack'].includes(b.accessoire) ? (acc[b.accessoire] || '') : '';
+  // volgorde van tekenen: achter de blob, dan ervoor (de helm als laatste, als een bel over alles heen)
+  const laag = ids => ids.filter(id => draagt.has(id)).map(id => acc[id]).join('');
+  const achter = laag(['cape', 'jetpack']);
+  const voor = laag(['ring', 'bril', 'koptelefoon', 'antenne', 'kroon', 'ster', 'helm']);
   return `<svg viewBox="0 0 100 100" width="${grootte}" height="${grootte}" class="blob" aria-hidden="true">
     ${achter}
     <path d="M50 18 C72 18 86 34 86 56 C86 78 74 90 50 90 C26 90 14 78 14 56 C14 34 28 18 50 18z" fill="${k}"/>
@@ -119,6 +122,20 @@ function sterrenbeeldSVG(kaart, grootte = 260) {
   return `<svg viewBox="0 0 100 100" width="${grootte}" height="${grootte}" class="sterrenbeeld">${lijnen}${sterren}</svg>`;
 }
 
+function herhalingsSterSVG(grootte = 84, status = 'huidig') {
+  const g = nid();
+  const dicht = status === 'slot';
+  const k1 = dicht ? '#64748b' : '#fde047', k2 = dicht ? '#334155' : '#f59e0b';
+  return `<svg viewBox="0 0 100 100" width="${grootte}" height="${grootte}" aria-hidden="true">
+    <defs><radialGradient id="${g}" cx="40%" cy="35%" r="70%"><stop offset="0" stop-color="${k1}"/><stop offset="1" stop-color="${k2}"/></radialGradient></defs>
+    ${dicht ? '' : '<circle cx="50" cy="52" r="44" fill="#facc15" opacity=".15"/>'}
+    <path d="M50 6 L62 36 L94 38 L69 58 L78 90 L50 72 L22 90 L31 58 L6 38 L38 36z" fill="url(#${g})" stroke="${dicht ? '#1e293b' : '#b45309'}" stroke-width="3" stroke-linejoin="round"/>
+    ${dicht ? '<text x="50" y="62" text-anchor="middle" font-size="22">🔒</text>'
+      : status === 'klaar' ? '<path d="M37 52 l9 9 l17 -19" stroke="#fff" stroke-width="7" fill="none" stroke-linecap="round" stroke-linejoin="round"/>'
+      : '<circle cx="42" cy="50" r="4" fill="#422006"/><circle cx="58" cy="50" r="4" fill="#422006"/><path d="M43 60 Q50 66 57 60" stroke="#422006" stroke-width="3" fill="none" stroke-linecap="round"/>'}
+  </svg>`;
+}
+
 function munt(grootte = 22) {
   return `<svg viewBox="0 0 24 24" width="${grootte}" height="${grootte}" aria-hidden="true" class="munt-ico"><circle cx="12" cy="12" r="10" fill="#facc15" stroke="#ca8a04" stroke-width="2"/><path d="M12 6.5l1.6 3.3 3.6.5-2.6 2.5.6 3.6L12 14.7l-3.2 1.7.6-3.6-2.6-2.5 3.6-.5z" fill="#fef9c3"/></svg>`;
 }
@@ -127,5 +144,5 @@ function raketSVG(grootte = 48) {
   return `<svg viewBox="0 0 64 64" width="${grootte}" height="${grootte}" aria-hidden="true" class="raket"><path d="M32 4 C44 14 46 30 42 44 H22 C18 30 20 14 32 4z" fill="#f1f5f9"/><circle cx="32" cy="24" r="6" fill="#38bdf8" stroke="#0f172a" stroke-width="2"/><path d="M22 36 L12 50 L22 46z M42 36 L52 50 L42 46z" fill="#ef4444"/><path d="M26 44 h12 l-6 14z" fill="#f97316" class="vlam"/></svg>`;
 }
 
-window.Art = { planeetSVG, blobSVG, alienSVG, sterrenbeeldSVG, munt, raketSVG };
+window.Art = { planeetSVG, blobSVG, alienSVG, sterrenbeeldSVG, herhalingsSterSVG, munt, raketSVG };
 })();

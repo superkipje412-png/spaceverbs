@@ -1,6 +1,6 @@
 # SpaceVerbs: leerdoelen per planeet
 
-Leerlingen starten op de Aarde. Per planeet maken ze **100 vragen** goed (70 zelf invullen in een zin, 30 meerkeuze). Fout beantwoorde vragen komen terug tot ze goed zijn. Daarna volgt een **toets van 10 vragen**: alle 10 goed, dan gaat de volgende planeet open.
+Leerlingen starten op de Aarde. Per planeet maken ze **100 vragen** goed (70 zelf invullen in een zin, 30 meerkeuze). Fout beantwoorde vragen komen terug tot ze goed zijn. Daarna volgt een **toets van 10 vragen**: alle 10 goed = planeet gehaald. Tussen elke twee planeten ligt een **herhalingsster**: 10 gemengde vragen van alle planeten tot dan toe. Minstens 9 goed? Dan gaat de volgende planeet open.
 
 | # | Planeet | Leerdoel | Voorbeelden |
 |---|---|---|---|

@@ -48,14 +48,14 @@ function cookies(req) {
   }
   return uit;
 }
-function sessie(req) {
+async function sessie(req) {
   const token = cookies(req).sv;
   if (!token) return null;
-  return db.prepare('SELECT * FROM sessies WHERE token = ?').get(token) || null;
+  return await db.get('SELECT * FROM sessies WHERE token = ?', token) || null;
 }
-function nieuweSessie(res, soort, id) {
+async function nieuweSessie(res, soort, id) {
   const token = crypto.randomBytes(32).toString('hex');
-  db.prepare('INSERT INTO sessies (token, soort, gebruiker_id) VALUES (?, ?, ?)').run(token, soort, id);
+  await db.run('INSERT INTO sessies (token, soort, gebruiker_id) VALUES (?, ?, ?)', token, soort, id);
   // Online (achter https) krijgt het inlogkoekje ook de Secure-vlag
   const veilig = res.req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
   res.setHeader('Set-Cookie', `sv=${token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${60 * 60 * 24 * 180}${veilig}`);
@@ -64,7 +64,8 @@ function nieuweSessie(res, soort, id) {
 // Eenvoudige rem op inlogpogingen per IP
 const pogingenPerIp = new Map();
 function remInlog(req) {
-  const ip = req.socket.remoteAddress;
+  // Online komt iedereen binnen via de proxy van de host; het echte adres staat dan in x-forwarded-for
+  const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress).split(',')[0].trim();
   const t = Date.now();
   const lijst = (pogingenPerIp.get(ip) || []).filter(x => t - x < 60_000);
   lijst.push(t);
@@ -74,19 +75,19 @@ function remInlog(req) {
 
 const WOORDEN = ['raket', 'komeet', 'ster', 'maan', 'planeet', 'alien', 'robot', 'zon', 'meteoor', 'galaxy', 'ufo', 'nova'];
 const maakWachtwoord = () => WOORDEN[crypto.randomInt(WOORDEN.length)] + (10 + crypto.randomInt(90));
-function maakGebruikersnaam(naam) {
+async function maakGebruikersnaam(naam) {
   const delen = naam.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z ]/g, '').split(' ').filter(Boolean);
   const basis = (delen[0] || 'leerling').slice(0, 10) + (delen.length > 1 ? delen[delen.length - 1][0] : '');
   for (let i = 0; i < 1000; i++) {
     const kandidaat = basis + (10 + crypto.randomInt(i < 50 ? 90 : 900));
-    if (!db.prepare('SELECT 1 FROM leerlingen WHERE gebruikersnaam = ?').get(kandidaat)) return kandidaat;
+    if (!await db.get('SELECT 1 FROM leerlingen WHERE gebruikersnaam = ?', kandidaat)) return kandidaat;
   }
   throw new Fout(500, 'Kon geen gebruikersnaam maken');
 }
 
 // ---------- spelregels ----------
-function gedaanPerPlaneet(leerlingId) {
-  const rijen = db.prepare('SELECT planeet, COUNT(*) AS n FROM voortgang WHERE leerling_id = ? AND goed > 0 GROUP BY planeet').all(leerlingId);
+async function gedaanPerPlaneet(leerlingId) {
+  const rijen = await db.all('SELECT planeet, COUNT(*) AS n FROM voortgang WHERE leerling_id = ? AND goed > 0 GROUP BY planeet', leerlingId);
   const uit = PLANETEN.map(() => 0);
   for (const r of rijen) uit[r.planeet] = r.n;
   return uit;
@@ -127,9 +128,9 @@ function vraagVoorLeerling(v) {
   const { id, type, zin, ww, opties, hoofdletter, planeet } = v;
   return { id, type, zin, ww, opties, hoofdletter, planeet };
 }
-function leerlingStatus(l) {
-  const gedaan = gedaanPerPlaneet(l.id);
-  const groep = db.prepare('SELECT * FROM groepen WHERE id = ?').get(l.groep_id);
+async function leerlingStatus(l) {
+  const gedaan = await gedaanPerPlaneet(l.id);
+  const groep = await db.get('SELECT * FROM groepen WHERE id = ?', l.groep_id);
   return {
     leerling: { id: l.id, naam: l.naam, munten: l.munten, planeet: l.planeet, herhaling: l.herhaling, reeks: l.reeks, blob: blobVan(l), oefen_min: Math.round(l.oefen_sec / 60) },
     groep: { naam: groep.naam },
@@ -150,17 +151,38 @@ function leerlingStatus(l) {
 }
 
 // Tijd en dierentuin bijwerken, geeft een nieuw dier terug als dat net ontgrendeld is.
-function telTijd(l, sec) {
+async function telTijd(l, sec) {
   sec = Math.max(0, Math.min(SPEL.MAX_SEC_PER_VRAAG, Math.ceil(Number(sec) || 0)));
-  const groep = db.prepare('SELECT * FROM groepen WHERE id = ?').get(l.groep_id);
+  const groep = await db.get('SELECT * FROM groepen WHERE id = ?', l.groep_id);
   const voor = dierentuin(groep).ontgrendeld;
-  db.prepare('UPDATE leerlingen SET oefen_sec = oefen_sec + ?, laatst_actief = ? WHERE id = ?').run(sec, nu(), l.id);
+  await db.run('UPDATE leerlingen SET oefen_sec = oefen_sec + ?, laatst_actief = ? WHERE id = ?', sec, nu(), l.id);
   // De dierentuin groeit alleen tijdens een oefenles die de leerkracht heeft aangezet (dus niet thuis).
   if (!lesActief(groep)) return null;
-  db.prepare('UPDATE groepen SET dierentuin_sec = dierentuin_sec + ? WHERE id = ?').run(sec, groep.id);
+  await db.run('UPDATE groepen SET dierentuin_sec = dierentuin_sec + ? WHERE id = ?', sec, groep.id);
   const na = dierentuin({ ...groep, dierentuin_sec: groep.dierentuin_sec + sec }).ontgrendeld;
   return na > voor ? SPEL.DIEREN[na - 1] : null;
 }
+
+// ---------- verwijderen ----------
+// De online database (Turso) ruimt gekoppelde rijen niet vanzelf op, dus dat doen we hier zelf, in één keer.
+const leerlingSql = [
+  'DELETE FROM voortgang WHERE leerling_id IN ($)', 'DELETE FROM pogingen WHERE leerling_id IN ($)',
+  'DELETE FROM toetsen WHERE leerling_id IN ($)', 'DELETE FROM sterren WHERE leerling_id IN ($)',
+  "DELETE FROM sessies WHERE soort = 'leerling' AND gebruiker_id IN ($)", 'DELETE FROM leerlingen WHERE id IN ($)'
+];
+const verwijderLeerling = id => db.batch(leerlingSql.map(q => [q.replace('$', '?'), id]));
+const groepSql = sub => leerlingSql.map(q => q.replace('$', sub));
+const verwijderGroep = id => db.batch([
+  ...groepSql('SELECT id FROM leerlingen WHERE groep_id = ?').map(q => [q, id]),
+  ['DELETE FROM groepen WHERE id = ?', id]
+]);
+const verwijderLeerkracht = id => db.batch([
+  ...groepSql('SELECT l.id FROM leerlingen l JOIN groepen g ON g.id = l.groep_id WHERE g.leerkracht_id = ?').map(q => [q, id]),
+  ['DELETE FROM groepen WHERE leerkracht_id = ?', id],
+  ['DELETE FROM uitnodigingen WHERE gemaakt_door = ?', id],
+  ["DELETE FROM sessies WHERE soort = 'leerkracht' AND gebruiker_id = ?", id],
+  ['DELETE FROM leerkrachten WHERE id = ?', id]
+]);
 
 // ---------- routes ----------
 const routes = [];
@@ -171,67 +193,67 @@ const route = (methode, patroon, rol, fn) => {
 };
 
 // --- inloggen ---
-route('POST', '/api/leerkracht/registreer', null, ({ body, res }) => {
+route('POST', '/api/leerkracht/registreer', null, async ({ body, res }) => {
   const naam = String(body.naam || '').trim(), email = norm(body.email), ww = String(body.wachtwoord || '');
   if (!naam || !/^\S+@\S+\.\S+$/.test(email)) throw new Fout(400, 'Vul je naam en een geldig e-mailadres in.');
   if (ww.length < 8) throw new Fout(400, 'Kies een wachtwoord van minimaal 8 tekens.');
-  if (db.prepare('SELECT 1 FROM leerkrachten WHERE email = ?').get(email)) throw new Fout(400, 'Dit e-mailadres heeft al een account.');
+  if (await db.get('SELECT 1 FROM leerkrachten WHERE email = ?', email)) throw new Fout(400, 'Dit e-mailadres heeft al een account.');
   // De allereerste leerkracht wordt beheerder. Daarna kan alleen iemand met een uitnodigingscode een account maken.
-  const eerste = !db.prepare('SELECT 1 FROM leerkrachten').get();
+  const eerste = !await db.get('SELECT 1 FROM leerkrachten');
   let uitnodiging = null;
   if (!eerste) {
     const code = String(body.code || '').trim().toUpperCase();
-    uitnodiging = db.prepare('SELECT * FROM uitnodigingen WHERE code = ? AND gebruikt_door IS NULL AND verloopt > ?').get(code, nu());
+    uitnodiging = await db.get('SELECT * FROM uitnodigingen WHERE code = ? AND gebruikt_door IS NULL AND verloopt > ?', code, nu());
     if (!uitnodiging) throw new Fout(400, 'Deze uitnodigingscode klopt niet of is verlopen. Vraag de beheerder van SpaceVerbs om een nieuwe code.');
   }
-  const { lastInsertRowid } = db.prepare('INSERT INTO leerkrachten (naam, email, wachtwoord, beheerder) VALUES (?, ?, ?, ?)').run(naam, email, hash(ww), eerste ? 1 : 0);
-  if (uitnodiging) db.prepare('UPDATE uitnodigingen SET gebruikt_door = ? WHERE code = ?').run(Number(lastInsertRowid), uitnodiging.code);
-  nieuweSessie(res, 'leerkracht', Number(lastInsertRowid));
+  const { lastInsertRowid } = await db.run('INSERT INTO leerkrachten (naam, email, wachtwoord, beheerder) VALUES (?, ?, ?, ?)', naam, email, hash(ww), eerste ? 1 : 0);
+  if (uitnodiging) await db.run('UPDATE uitnodigingen SET gebruikt_door = ? WHERE code = ?', Number(lastInsertRowid), uitnodiging.code);
+  await nieuweSessie(res, 'leerkracht', Number(lastInsertRowid));
   return { ok: true };
 });
-route('GET', '/api/leerkracht/eerste', null, () => ({ eerste: !db.prepare('SELECT 1 FROM leerkrachten').get() }));
-route('POST', '/api/leerkracht/login', null, ({ body, res, req }) => {
+route('GET', '/api/leerkracht/eerste', null, async () => ({ eerste: !await db.get('SELECT 1 FROM leerkrachten') }));
+route('POST', '/api/leerkracht/login', null, async ({ body, res, req }) => {
   remInlog(req);
-  const lk = db.prepare('SELECT * FROM leerkrachten WHERE email = ?').get(norm(body.email));
+  const lk = await db.get('SELECT * FROM leerkrachten WHERE email = ?', norm(body.email));
   if (!lk || !klopt(String(body.wachtwoord || ''), lk.wachtwoord)) throw new Fout(401, 'E-mailadres of wachtwoord klopt niet.');
-  nieuweSessie(res, 'leerkracht', lk.id);
+  await nieuweSessie(res, 'leerkracht', lk.id);
   return { ok: true };
 });
-route('POST', '/api/leerling/login', null, ({ body, res, req }) => {
+route('POST', '/api/leerling/login', null, async ({ body, res, req }) => {
   remInlog(req);
-  const l = db.prepare('SELECT * FROM leerlingen WHERE gebruikersnaam = ?').get(norm(body.gebruikersnaam));
+  const l = await db.get('SELECT * FROM leerlingen WHERE gebruikersnaam = ?', norm(body.gebruikersnaam));
   if (!l || norm(body.wachtwoord) !== norm(l.wachtwoord)) throw new Fout(401, 'Deze naam of dit wachtwoord klopt niet. Probeer het nog eens!');
-  nieuweSessie(res, 'leerling', l.id);
+  await nieuweSessie(res, 'leerling', l.id);
   return { ok: true };
 });
-route('POST', '/api/loguit', null, ({ req, res }) => {
-  const s = sessie(req);
-  if (s) db.prepare('DELETE FROM sessies WHERE token = ?').run(s.token);
+route('POST', '/api/loguit', null, async ({ req, res }) => {
+  const s = await sessie(req);
+  if (s) await db.run('DELETE FROM sessies WHERE token = ?', s.token);
   res.setHeader('Set-Cookie', 'sv=; HttpOnly; Path=/; Max-Age=0');
   return { ok: true };
 });
-route('GET', '/api/ik', null, ({ req }) => {
-  const s = sessie(req);
+route('GET', '/api/ik', null, async ({ req }) => {
+  const s = await sessie(req);
   if (!s) return { rol: null };
   if (s.soort === 'leerkracht') {
-    const lk = db.prepare('SELECT id, naam, email, beheerder FROM leerkrachten WHERE id = ?').get(s.gebruiker_id);
+    const lk = await db.get('SELECT id, naam, email, beheerder FROM leerkrachten WHERE id = ?', s.gebruiker_id);
     return lk ? { rol: 'leerkracht', leerkracht: lk } : { rol: null };
   }
-  const l = db.prepare('SELECT id, naam FROM leerlingen WHERE id = ?').get(s.gebruiker_id);
+  const l = await db.get('SELECT id, naam FROM leerlingen WHERE id = ?', s.gebruiker_id);
   return l ? { rol: 'leerling', leerling: l } : { rol: null };
 });
 
 // --- leerling ---
-route('GET', '/api/status', 'leerling', ({ l }) => leerlingStatus(l));
+route('GET', '/api/status', 'leerling', async ({ l }) => await leerlingStatus(l));
 
-route('POST', '/api/blob', 'leerling', ({ l, body }) => {
+route('POST', '/api/blob', 'leerling', async ({ l, body }) => {
   const kleuren = ['#22c55e', '#3b82f6', '#a855f7', '#ec4899', '#f97316', '#facc15', '#06b6d4', '#ef4444'];
   const kleur = kleuren.includes(body.kleur) ? body.kleur : kleuren[0];
   const ogen = [1, 2, 3].includes(Number(body.ogen)) ? Number(body.ogen) : 2;
   const gekozen = Array.isArray(body.accessoires) ? body.accessoires : [];
   const accessoires = SPEL.ACCESSOIRES.filter(a => a.id !== 'geen' && a.planeet < l.planeet && gekozen.includes(a.id)).map(a => a.id);
   const naam = String(body.naam || '').trim().slice(0, 20) || 'Blobbie';
-  db.prepare('UPDATE leerlingen SET blob = ? WHERE id = ?').run(JSON.stringify({ kleur, ogen, accessoires, naam }), l.id);
+  await db.run('UPDATE leerlingen SET blob = ? WHERE id = ?', JSON.stringify({ kleur, ogen, accessoires, naam }), l.id);
   return { ok: true };
 });
 
@@ -241,7 +263,7 @@ function magPlaneet(l, p) {
   return p;
 }
 
-route('GET', '/api/oefenen', 'leerling', ({ l, query }) => {
+route('GET', '/api/oefenen', 'leerling', async ({ l, query }) => {
   if (query.ster !== undefined) {
     // oefenen voor een herhalingsster: gemengde vragen uit alle planeten tot nu toe
     const k = magPlaneet(l, query.ster);
@@ -249,29 +271,27 @@ route('GET', '/api/oefenen', 'leerling', ({ l, query }) => {
     return { ster: k, vragen: gemengd(k, 10).map(vraagVoorLeerling) };
   }
   const p = magPlaneet(l, query.planeet);
-  const goed = new Set(db.prepare('SELECT vraag_id FROM voortgang WHERE leerling_id = ? AND planeet = ? AND goed > 0').all(l.id, p).map(r => r.vraag_id));
+  const goed = new Set((await db.all('SELECT vraag_id FROM voortgang WHERE leerling_id = ? AND planeet = ? AND goed > 0', l.id, p)).map(r => r.vraag_id));
   const open = schud(PER_PLANEET[p].filter(v => !goed.has(v.id)));
   const herhaal = schud(PER_PLANEET[p].filter(v => goed.has(v.id)));
   const ronde = [...open, ...herhaal].slice(0, 10);
   return { planeet: p, vragen: ronde.map(vraagVoorLeerling), herhaling: open.length === 0 };
 });
 
-route('POST', '/api/antwoord', 'leerling', ({ l, body }) => {
+route('POST', '/api/antwoord', 'leerling', async ({ l, body }) => {
   const v = VRAAG.get(String(body.id));
   if (!v) throw new Fout(404, 'Vraag niet gevonden');
   magPlaneet(l, v.planeet);
   const antwoord = String(body.antwoord || '').slice(0, 60);
   const goed = norm(antwoord) === norm(v.antwoord);
   const cat = goed ? null : categorie(antwoord, v, VORMEN.get(v.ww));
-  const nieuwDier = telTijd(l, body.sec);
+  const nieuwDier = await telTijd(l, body.sec);
 
-  const vg = db.prepare('SELECT * FROM voortgang WHERE leerling_id = ? AND vraag_id = ?').get(l.id, v.id);
+  const vg = await db.get('SELECT * FROM voortgang WHERE leerling_id = ? AND vraag_id = ?', l.id, v.id);
   const eersteKeerGoed = goed && (!vg || vg.goed === 0);
-  db.prepare(`INSERT INTO voortgang (leerling_id, vraag_id, planeet, goed, fout) VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(leerling_id, vraag_id) DO UPDATE SET goed = goed + excluded.goed, fout = fout + excluded.fout`)
-    .run(l.id, v.id, v.planeet, goed ? 1 : 0, goed ? 0 : 1);
-  db.prepare('INSERT INTO pogingen (leerling_id, vraag_id, planeet, antwoord, goed, categorie, modus) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(l.id, v.id, v.planeet, antwoord, goed ? 1 : 0, cat, 'oefenen');
+  await db.run(`INSERT INTO voortgang (leerling_id, vraag_id, planeet, goed, fout) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(leerling_id, vraag_id) DO UPDATE SET goed = goed + excluded.goed, fout = fout + excluded.fout`, l.id, v.id, v.planeet, goed ? 1 : 0, goed ? 0 : 1);
+  await db.run('INSERT INTO pogingen (leerling_id, vraag_id, planeet, antwoord, goed, categorie, modus) VALUES (?, ?, ?, ?, ?, ?, ?)', l.id, v.id, v.planeet, antwoord, goed ? 1 : 0, cat, 'oefenen');
 
   let verdiend = 0, bonus = 0;
   const reeks = goed ? l.reeks + 1 : 0;
@@ -279,35 +299,33 @@ route('POST', '/api/antwoord', 'leerling', ({ l, body }) => {
     verdiend = eersteKeerGoed ? SPEL.MUNTEN[v.type] : SPEL.MUNTEN.herhaling;
     if (reeks % 5 === 0) bonus = SPEL.MUNTEN.reeks;
   }
-  db.prepare('UPDATE leerlingen SET munten = munten + ?, reeks = ? WHERE id = ?').run(verdiend + bonus, reeks, l.id);
-  const gedaan = gedaanPerPlaneet(l.id)[v.planeet];
+  await db.run('UPDATE leerlingen SET munten = munten + ?, reeks = ? WHERE id = ?', verdiend + bonus, reeks, l.id);
+  const gedaan = (await gedaanPerPlaneet(l.id))[v.planeet];
   return {
     goed, antwoord: v.antwoord, uitleg: v.uitleg, regel: v.regel, verdiend, bonus, reeks,
     munten: l.munten + verdiend + bonus, gedaan, totaal: AANTAL(v.planeet), nieuwDier
   };
 });
 
-route('POST', '/api/toets/start', 'leerling', ({ l, body }) => {
+route('POST', '/api/toets/start', 'leerling', async ({ l, body }) => {
   const p = magPlaneet(l, body.planeet);
   if (p !== l.planeet || l.herhaling !== null) throw new Fout(400, 'Deze toets kun je nu niet doen.');
-  if (gedaanPerPlaneet(l.id)[p] < AANTAL(p)) throw new Fout(400, 'Maak eerst alle vragen van deze planeet goed.');
+  if ((await gedaanPerPlaneet(l.id))[p] < AANTAL(p)) throw new Fout(400, 'Maak eerst alle vragen van deze planeet goed.');
   const vragen = schud(PER_PLANEET[p]).slice(0, SPEL.TOETS_AANTAL);
-  const { lastInsertRowid } = db.prepare('INSERT INTO toetsen (leerling_id, planeet, vragen) VALUES (?, ?, ?)')
-    .run(l.id, p, JSON.stringify(vragen.map(v => v.id)));
+  const { lastInsertRowid } = await db.run('INSERT INTO toetsen (leerling_id, planeet, vragen) VALUES (?, ?, ?)', l.id, p, JSON.stringify(vragen.map(v => v.id)));
   return { toets_id: Number(lastInsertRowid), vragen: vragen.map(vraagVoorLeerling) };
 });
 
-route('POST', '/api/ster/start', 'leerling', ({ l, body }) => {
+route('POST', '/api/ster/start', 'leerling', async ({ l, body }) => {
   const k = Number(body.ster);
   if (l.herhaling === null || k !== l.herhaling) throw new Fout(400, 'Deze herhalingsster kun je nu niet doen.');
   const vragen = gemengd(k, SPEL.HERHALING_AANTAL);
-  const { lastInsertRowid } = db.prepare("INSERT INTO toetsen (leerling_id, planeet, vragen, soort) VALUES (?, ?, ?, 'ster')")
-    .run(l.id, k, JSON.stringify(vragen.map(v => v.id)));
+  const { lastInsertRowid } = await db.run("INSERT INTO toetsen (leerling_id, planeet, vragen, soort) VALUES (?, ?, ?, 'ster')", l.id, k, JSON.stringify(vragen.map(v => v.id)));
   return { toets_id: Number(lastInsertRowid), vragen: vragen.map(vraagVoorLeerling), nodig: SPEL.HERHALING_NODIG };
 });
 
-route('POST', '/api/toets/antwoord', 'leerling', ({ l, body }) => {
-  const t = db.prepare('SELECT * FROM toetsen WHERE id = ? AND leerling_id = ?').get(Number(body.toets_id), l.id);
+route('POST', '/api/toets/antwoord', 'leerling', async ({ l, body }) => {
+  const t = await db.get('SELECT * FROM toetsen WHERE id = ? AND leerling_id = ?', Number(body.toets_id), l.id);
   if (!t || t.klaar) throw new Fout(400, 'Deze toets is al klaar.');
   const ids = JSON.parse(t.vragen);
   const antwoorden = JSON.parse(t.antwoorden);
@@ -317,24 +335,22 @@ route('POST', '/api/toets/antwoord', 'leerling', ({ l, body }) => {
   const antwoord = String(body.antwoord || '').slice(0, 60);
   const goed = norm(antwoord) === norm(v.antwoord);
   antwoorden.push({ id, antwoord, goed });
-  const nieuwDier = telTijd(l, body.sec);
-  db.prepare('INSERT INTO pogingen (leerling_id, vraag_id, planeet, antwoord, goed, categorie, modus) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(l.id, v.id, v.planeet, antwoord, goed ? 1 : 0, goed ? null : categorie(antwoord, v, VORMEN.get(v.ww)), 'toets');
+  const nieuwDier = await telTijd(l, body.sec);
+  await db.run('INSERT INTO pogingen (leerling_id, vraag_id, planeet, antwoord, goed, categorie, modus) VALUES (?, ?, ?, ?, ?, ?, ?)', l.id, v.id, v.planeet, antwoord, goed ? 1 : 0, goed ? null : categorie(antwoord, v, VORMEN.get(v.ww)), 'toets');
 
   if (antwoorden.length < ids.length) {
-    db.prepare('UPDATE toetsen SET antwoorden = ? WHERE id = ?').run(JSON.stringify(antwoorden), t.id);
+    await db.run('UPDATE toetsen SET antwoorden = ? WHERE id = ?', JSON.stringify(antwoorden), t.id);
     return { klaar: false, nieuwDier };
   }
   const score = antwoorden.filter(a => a.goed).length;
   const ster = t.soort === 'ster';
   const nodig = ster ? SPEL.HERHALING_NODIG : ids.length;
   const gehaald = score >= nodig;
-  db.prepare('UPDATE toetsen SET antwoorden = ?, score = ?, gehaald = ?, klaar = ? WHERE id = ?')
-    .run(JSON.stringify(antwoorden), score, gehaald ? 1 : 0, nu(), t.id);
+  await db.run('UPDATE toetsen SET antwoorden = ?, score = ?, gehaald = ?, klaar = ? WHERE id = ?', JSON.stringify(antwoorden), score, gehaald ? 1 : 0, nu(), t.id);
   let verdiend = 0, accessoire = null, herhalingsster = false;
   if (gehaald && ster && l.herhaling === t.planeet) {
     verdiend = SPEL.MUNTEN.herhalingsster;
-    db.prepare('UPDATE leerlingen SET herhaling = NULL, munten = munten + ? WHERE id = ?').run(verdiend, l.id);
+    await db.run('UPDATE leerlingen SET herhaling = NULL, munten = munten + ? WHERE id = ?', verdiend, l.id);
   } else if (gehaald && !ster && t.planeet === l.planeet && l.herhaling === null) {
     verdiend = SPEL.MUNTEN.toets;
     // na elke planeet (behalve de laatste) volgt eerst een herhalingsster
@@ -342,8 +358,7 @@ route('POST', '/api/toets/antwoord', 'leerling', ({ l, body }) => {
     accessoire = SPEL.ACCESSOIRES.find(a => a.planeet === t.planeet) || null;
     const blob = blobVan(l);
     if (blob && accessoire && !blob.accessoires.includes(accessoire.id)) blob.accessoires.push(accessoire.id); // meteen aantrekken
-    db.prepare('UPDATE leerlingen SET planeet = planeet + 1, herhaling = ?, munten = munten + ?, blob = ? WHERE id = ?')
-      .run(herhalingsster ? t.planeet : null, verdiend, blob ? JSON.stringify(blob) : l.blob, l.id);
+    await db.run('UPDATE leerlingen SET planeet = planeet + 1, herhaling = ?, munten = munten + ?, blob = ? WHERE id = ?', herhalingsster ? t.planeet : null, verdiend, blob ? JSON.stringify(blob) : l.blob, l.id);
   }
   return {
     klaar: true, score, totaal: ids.length, nodig, gehaald, verdiend, nieuwDier, ster, herhalingsster, accessoire,
@@ -351,8 +366,8 @@ route('POST', '/api/toets/antwoord', 'leerling', ({ l, body }) => {
   };
 });
 
-function winkelKaarten(l) {
-  const gekocht = db.prepare('SELECT beeld, nr FROM sterren WHERE leerling_id = ?').all(l.id);
+async function winkelKaarten(l) {
+  const gekocht = await db.all('SELECT beeld, nr FROM sterren WHERE leerling_id = ?', l.id);
   let vorigeVol = true;
   const kaarten = SPEL.STERRENBEELDEN.map(b => {
     const mijn = gekocht.filter(g => g.beeld === b.id).map(g => g.nr);
@@ -362,22 +377,22 @@ function winkelKaarten(l) {
   });
   return kaarten;
 }
-route('GET', '/api/winkel', 'leerling', ({ l }) => ({ munten: l.munten, kaarten: winkelKaarten(l) }));
-route('POST', '/api/winkel/koop', 'leerling', ({ l, body }) => {
-  const kaart = winkelKaarten(l).find(k => k.id === body.beeld);
+route('GET', '/api/winkel', 'leerling', async ({ l }) => ({ munten: l.munten, kaarten: await winkelKaarten(l) }));
+route('POST', '/api/winkel/koop', 'leerling', async ({ l, body }) => {
+  const kaart = (await winkelKaarten(l)).find(k => k.id === body.beeld);
   const nr = Number(body.nr);
   if (!kaart || !kaart.open) throw new Fout(400, 'Deze spaarkaart is nog op slot.');
   if (!Number.isInteger(nr) || nr < 0 || nr >= kaart.sterren.length || kaart.gekocht.includes(nr)) throw new Fout(400, 'Deze ster kun je niet kopen.');
   if (l.munten < kaart.prijs) throw new Fout(400, `Je hebt ${kaart.prijs} munten nodig. Nog even sparen!`);
-  db.prepare('UPDATE leerlingen SET munten = munten - ? WHERE id = ?').run(kaart.prijs, l.id);
-  db.prepare('INSERT INTO sterren (leerling_id, beeld, nr) VALUES (?, ?, ?)').run(l.id, kaart.id, nr);
+  await db.run('UPDATE leerlingen SET munten = munten - ? WHERE id = ?', kaart.prijs, l.id);
+  await db.run('INSERT INTO sterren (leerling_id, beeld, nr) VALUES (?, ?, ?)', l.id, kaart.id, nr);
   return { ok: true, munten: l.munten - kaart.prijs, vol: kaart.gekocht.length + 1 === kaart.sterren.length, naam: kaart.naam };
 });
 
-route('GET', '/api/dierentuin', 'leerling', ({ l }) => {
-  const groep = db.prepare('SELECT * FROM groepen WHERE id = ?').get(l.groep_id);
+route('GET', '/api/dierentuin', 'leerling', async ({ l }) => {
+  const groep = await db.get('SELECT * FROM groepen WHERE id = ?', l.groep_id);
   const dt = dierentuin(groep);
-  const klas = db.prepare('SELECT naam, oefen_sec, blob FROM leerlingen WHERE groep_id = ? ORDER BY naam').all(l.groep_id);
+  const klas = await db.all('SELECT naam, oefen_sec, blob FROM leerlingen WHERE groep_id = ? ORDER BY naam', l.groep_id);
   return {
     groep: groep.naam, ...dt, mijn_min: Math.round(l.oefen_sec / 60),
     dieren: SPEL.DIEREN.map((d, i) => (i < dt.ontgrendeld ? { ...d, open: true } : { id: d.id, soort: d.soort, open: false })),
@@ -386,57 +401,66 @@ route('GET', '/api/dierentuin', 'leerling', ({ l }) => {
 });
 
 // --- leerkracht ---
-function mijnGroep(lk, id) {
-  const g = db.prepare('SELECT * FROM groepen WHERE id = ? AND leerkracht_id = ?').get(Number(id), lk.id);
+async function mijnGroep(lk, id) {
+  const g = await db.get('SELECT * FROM groepen WHERE id = ? AND leerkracht_id = ?', Number(id), lk.id);
   if (!g) throw new Fout(404, 'Groep niet gevonden');
   return g;
 }
-function mijnLeerling(lk, id) {
-  const l = db.prepare('SELECT l.* FROM leerlingen l JOIN groepen g ON g.id = l.groep_id WHERE l.id = ? AND g.leerkracht_id = ?').get(Number(id), lk.id);
+async function mijnLeerling(lk, id) {
+  const l = await db.get('SELECT l.* FROM leerlingen l JOIN groepen g ON g.id = l.groep_id WHERE l.id = ? AND g.leerkracht_id = ?', Number(id), lk.id);
   if (!l) throw new Fout(404, 'Leerling niet gevonden');
   return l;
 }
 
-route('GET', '/api/lk/groepen', 'leerkracht', ({ lk }) => ({
+route('GET', '/api/lk/groepen', 'leerkracht', async ({ lk }) => ({
   leerkracht: { naam: lk.naam, email: lk.email, beheerder: !!lk.beheerder },
-  groepen: db.prepare(`SELECT g.id, g.naam, g.minuten_per_dier, g.dierentuin_sec, g.les_tot, COUNT(l.id) AS leerlingen
-    FROM groepen g LEFT JOIN leerlingen l ON l.groep_id = g.id WHERE g.leerkracht_id = ? GROUP BY g.id ORDER BY g.naam`).all(lk.id)
+  groepen: (await db.all(`SELECT g.id, g.naam, g.minuten_per_dier, g.dierentuin_sec, g.les_tot, COUNT(l.id) AS leerlingen
+    FROM groepen g LEFT JOIN leerlingen l ON l.groep_id = g.id WHERE g.leerkracht_id = ? GROUP BY g.id ORDER BY g.naam`, lk.id))
     .map(g => ({ ...g, dierentuin: dierentuin(g) }))
 }));
-route('POST', '/api/lk/groepen', 'leerkracht', ({ lk, body }) => {
+route('POST', '/api/lk/groepen', 'leerkracht', async ({ lk, body }) => {
   const naam = String(body.naam || '').trim().slice(0, 40);
   if (!naam) throw new Fout(400, 'Geef de groep een naam.');
-  const { lastInsertRowid } = db.prepare('INSERT INTO groepen (leerkracht_id, naam) VALUES (?, ?)').run(lk.id, naam);
+  const { lastInsertRowid } = await db.run('INSERT INTO groepen (leerkracht_id, naam) VALUES (?, ?)', lk.id, naam);
   return { id: Number(lastInsertRowid) };
 });
-route('PATCH', '/api/lk/groepen/:id', 'leerkracht', ({ lk, body, params }) => {
-  const g = mijnGroep(lk, params.id);
+route('PATCH', '/api/lk/groepen/:id', 'leerkracht', async ({ lk, body, params }) => {
+  const g = await mijnGroep(lk, params.id);
   const naam = body.naam !== undefined ? String(body.naam).trim().slice(0, 40) || g.naam : g.naam;
   const min = body.minuten_per_dier !== undefined ? Math.max(1, Math.min(600, Math.round(Number(body.minuten_per_dier)) || 30)) : g.minuten_per_dier;
-  db.prepare('UPDATE groepen SET naam = ?, minuten_per_dier = ? WHERE id = ?').run(naam, min, g.id);
+  await db.run('UPDATE groepen SET naam = ?, minuten_per_dier = ? WHERE id = ?', naam, min, g.id);
   return { ok: true };
 });
-route('POST', '/api/lk/groepen/:id/les', 'leerkracht', ({ lk, body, params }) => {
-  const g = mijnGroep(lk, params.id);
+route('POST', '/api/lk/groepen/:id/les', 'leerkracht', async ({ lk, body, params }) => {
+  const g = await mijnGroep(lk, params.id);
   const min = Math.round(Number(body.minuten) || 0);
   if (min < 0 || min > 240) throw new Fout(400, 'Kies een lesduur tussen 1 en 240 minuten.');
   const tot = min ? new Date(Date.now() + min * 60_000).toISOString() : null; // 0 = les stoppen
-  db.prepare('UPDATE groepen SET les_tot = ? WHERE id = ?').run(tot, g.id);
+  await db.run('UPDATE groepen SET les_tot = ? WHERE id = ?', tot, g.id);
   return { les_tot: tot };
 });
-route('DELETE', '/api/lk/groepen/:id', 'leerkracht', ({ lk, params }) => {
-  const g = mijnGroep(lk, params.id);
-  db.prepare('DELETE FROM groepen WHERE id = ?').run(g.id);
+route('DELETE', '/api/lk/groepen/:id', 'leerkracht', async ({ lk, params }) => {
+  const g = await mijnGroep(lk, params.id);
+  await verwijderGroep(g.id);
   return { ok: true };
 });
 
-route('GET', '/api/lk/groepen/:id', 'leerkracht', ({ lk, params }) => {
-  const g = mijnGroep(lk, params.id);
-  const leerlingen = db.prepare('SELECT * FROM leerlingen WHERE groep_id = ? ORDER BY naam').all(g.id).map(l => {
-    const gedaan = gedaanPerPlaneet(l.id);
-    const p = db.prepare('SELECT COUNT(*) AS n, SUM(goed) AS g FROM pogingen WHERE leerling_id = ?').get(l.id);
-    const top = db.prepare(`SELECT categorie, COUNT(*) AS n FROM pogingen WHERE leerling_id = ? AND goed = 0
-      GROUP BY categorie ORDER BY n DESC LIMIT 1`).get(l.id);
+route('GET', '/api/lk/groepen/:id', 'leerkracht', async ({ lk, params }) => {
+  const g = await mijnGroep(lk, params.id);
+  // Per vraagsoort één query voor de hele groep (sneller bij een online database)
+  const [rijen, gedaanRijen, pogingRijen, foutRijen] = await Promise.all([
+    db.all('SELECT * FROM leerlingen WHERE groep_id = ? ORDER BY naam', g.id),
+    db.all(`SELECT v.leerling_id, v.planeet, COUNT(*) AS n FROM voortgang v JOIN leerlingen l ON l.id = v.leerling_id
+      WHERE l.groep_id = ? AND v.goed > 0 GROUP BY v.leerling_id, v.planeet`, g.id),
+    db.all(`SELECT p.leerling_id, COUNT(*) AS n, SUM(p.goed) AS g FROM pogingen p JOIN leerlingen l ON l.id = p.leerling_id
+      WHERE l.groep_id = ? GROUP BY p.leerling_id`, g.id),
+    db.all(`SELECT p.leerling_id, p.categorie, COUNT(*) AS n FROM pogingen p JOIN leerlingen l ON l.id = p.leerling_id
+      WHERE l.groep_id = ? AND p.goed = 0 GROUP BY p.leerling_id, p.categorie ORDER BY n DESC`, g.id)
+  ]);
+  const leerlingen = rijen.map(l => {
+    const gedaan = PLANETEN.map((_, i) => gedaanRijen.find(r => r.leerling_id === l.id && r.planeet === i)?.n || 0);
+    const p = pogingRijen.find(r => r.leerling_id === l.id) || { n: 0, g: 0 };
+    const top = foutRijen.find(r => r.leerling_id === l.id);
     return {
       id: l.id, naam: l.naam, gebruikersnaam: l.gebruikersnaam, wachtwoord: l.wachtwoord, planeet: l.planeet, herhaling: l.herhaling,
       gedaan: l.planeet < PLANETEN.length ? gedaan[l.planeet] : null, munten: l.munten,
@@ -445,51 +469,54 @@ route('GET', '/api/lk/groepen/:id', 'leerkracht', ({ lk, params }) => {
       meeste_fouten: top ? CATEGORIEEN[top.categorie] : null, blob: blobVan(l)
     };
   });
-  const fouten = db.prepare(`SELECT categorie, COUNT(*) AS n FROM pogingen p JOIN leerlingen l ON l.id = p.leerling_id
-    WHERE l.groep_id = ? AND p.goed = 0 GROUP BY categorie ORDER BY n DESC`).all(g.id)
+  const fouten = (await db.all(`SELECT categorie, COUNT(*) AS n FROM pogingen p JOIN leerlingen l ON l.id = p.leerling_id
+    WHERE l.groep_id = ? AND p.goed = 0 GROUP BY categorie ORDER BY n DESC`, g.id))
     .map(r => ({ ...r, label: CATEGORIEEN[r.categorie] || r.categorie }));
-  const moeilijk = db.prepare(`SELECT vraag_id, SUM(goed = 0) AS fout, COUNT(*) AS totaal FROM pogingen p JOIN leerlingen l ON l.id = p.leerling_id
-    WHERE l.groep_id = ? GROUP BY vraag_id HAVING fout > 0 ORDER BY fout DESC, totaal ASC LIMIT 10`).all(g.id)
+  const moeilijk = (await db.all(`SELECT vraag_id, SUM(goed = 0) AS fout, COUNT(*) AS totaal FROM pogingen p JOIN leerlingen l ON l.id = p.leerling_id
+    WHERE l.groep_id = ? GROUP BY vraag_id HAVING fout > 0 ORDER BY fout DESC, totaal ASC LIMIT 10`, g.id))
     .map(r => { const v = VRAAG.get(r.vraag_id); return { ...r, zin: v.zin, ww: v.ww, antwoord: v.antwoord, planeet: v.planeet }; });
   return { groep: { id: g.id, naam: g.naam, minuten_per_dier: g.minuten_per_dier }, dierentuin: dierentuin(g), leerlingen, fouten, moeilijk };
 });
 
-route('POST', '/api/lk/groepen/:id/leerlingen', 'leerkracht', ({ lk, body, params }) => {
-  const g = mijnGroep(lk, params.id);
+route('POST', '/api/lk/groepen/:id/leerlingen', 'leerkracht', async ({ lk, body, params }) => {
+  const g = await mijnGroep(lk, params.id);
   const namen = (Array.isArray(body.namen) ? body.namen : String(body.namen || '').split('\n'))
     .map(n => String(n).trim().slice(0, 40)).filter(Boolean).slice(0, 60);
   if (!namen.length) throw new Fout(400, 'Vul minstens één naam in.');
-  const nieuw = namen.map(naam => {
-    const gebruikersnaam = maakGebruikersnaam(naam), wachtwoord = maakWachtwoord();
-    db.prepare('INSERT INTO leerlingen (groep_id, naam, gebruikersnaam, wachtwoord) VALUES (?, ?, ?, ?)').run(g.id, naam, gebruikersnaam, wachtwoord);
-    return { naam, gebruikersnaam, wachtwoord };
-  });
+  const nieuw = [];
+  for (const naam of namen) {
+    const gebruikersnaam = await maakGebruikersnaam(naam), wachtwoord = maakWachtwoord();
+    await db.run('INSERT INTO leerlingen (groep_id, naam, gebruikersnaam, wachtwoord) VALUES (?, ?, ?, ?)', g.id, naam, gebruikersnaam, wachtwoord);
+    nieuw.push({ naam, gebruikersnaam, wachtwoord });
+  }
   return { nieuw };
 });
 
-route('GET', '/api/lk/leerlingen/:id', 'leerkracht', ({ lk, params }) => {
-  const l = mijnLeerling(lk, params.id);
-  const gedaan = gedaanPerPlaneet(l.id);
+route('GET', '/api/lk/leerlingen/:id', 'leerkracht', async ({ lk, params }) => {
+  const l = await mijnLeerling(lk, params.id);
+  const gedaan = await gedaanPerPlaneet(l.id);
+  const perPlaneetRijen = await db.all(`SELECT planeet, COUNT(*) AS n, SUM(goed) AS g FROM pogingen
+    WHERE leerling_id = ? AND modus = 'oefenen' GROUP BY planeet`, l.id);
   const perPlaneet = PLANETEN.map((p, i) => {
-    const r = db.prepare('SELECT COUNT(*) AS n, SUM(goed) AS g FROM pogingen WHERE leerling_id = ? AND planeet = ? AND modus = ?').get(l.id, i, 'oefenen');
+    const r = perPlaneetRijen.find(x => x.planeet === i) || { n: 0, g: 0 };
     return { naam: p.naam, titel: p.titel, gedaan: gedaan[i], totaal: AANTAL(i), pogingen: r.n, percentage_goed: r.n ? Math.round((r.g / r.n) * 100) : null };
   });
-  const fouten = db.prepare('SELECT categorie, COUNT(*) AS n FROM pogingen WHERE leerling_id = ? AND goed = 0 GROUP BY categorie ORDER BY n DESC').all(l.id)
+  const fouten = (await db.all('SELECT categorie, COUNT(*) AS n FROM pogingen WHERE leerling_id = ? AND goed = 0 GROUP BY categorie ORDER BY n DESC', l.id))
     .map(r => ({ ...r, label: CATEGORIEEN[r.categorie] || r.categorie }));
-  const recent = db.prepare('SELECT * FROM pogingen WHERE leerling_id = ? AND goed = 0 ORDER BY id DESC LIMIT 40').all(l.id)
+  const recent = (await db.all('SELECT * FROM pogingen WHERE leerling_id = ? AND goed = 0 ORDER BY id DESC LIMIT 40', l.id))
     .map(r => { const v = VRAAG.get(r.vraag_id); return { zin: v.zin, ww: v.ww, antwoord: r.antwoord, juist: v.antwoord, label: CATEGORIEEN[r.categorie], modus: r.modus, tijd: r.tijd, planeet: v.planeet }; });
-  const toetsen = db.prepare('SELECT planeet, soort, score, gehaald, klaar, vragen FROM toetsen WHERE leerling_id = ? AND klaar IS NOT NULL ORDER BY id DESC').all(l.id)
+  const toetsen = (await db.all('SELECT planeet, soort, score, gehaald, klaar, vragen FROM toetsen WHERE leerling_id = ? AND klaar IS NOT NULL ORDER BY id DESC', l.id))
     .map(t => ({ planeet: t.planeet, soort: t.soort, score: t.score, gehaald: t.gehaald, klaar: t.klaar, totaal: JSON.parse(t.vragen).length,
       naam: t.soort === 'ster' ? `⭐ Herhalingsster na ${PLANETEN[t.planeet].naam}` : PLANETEN[t.planeet].naam }));
-  const sterren = db.prepare('SELECT COUNT(*) AS n FROM sterren WHERE leerling_id = ?').get(l.id).n;
+  const sterren = (await db.get('SELECT COUNT(*) AS n FROM sterren WHERE leerling_id = ?', l.id)).n;
   return {
     leerling: { id: l.id, naam: l.naam, gebruikersnaam: l.gebruikersnaam, wachtwoord: l.wachtwoord, planeet: l.planeet, herhaling: l.herhaling, munten: l.munten,
       oefen_min: Math.round(l.oefen_sec / 60), laatst_actief: l.laatst_actief, blob: blobVan(l), groep_id: l.groep_id, sterren },
     perPlaneet, fouten, recent, toetsen
   };
 });
-route('PATCH', '/api/lk/leerlingen/:id', 'leerkracht', ({ lk, body, params }) => {
-  const l = mijnLeerling(lk, params.id);
+route('PATCH', '/api/lk/leerlingen/:id', 'leerkracht', async ({ lk, body, params }) => {
+  const l = await mijnLeerling(lk, params.id);
   const naam = body.naam !== undefined ? String(body.naam).trim().slice(0, 40) || l.naam : l.naam;
   // stap: 'p3' = op planeet 3, 's2' = bij de herhalingsster na planeet 2
   let planeet = l.planeet, herhaling = l.herhaling;
@@ -501,21 +528,20 @@ route('PATCH', '/api/lk/leerlingen/:id', 'leerkracht', ({ lk, body, params }) =>
     else throw new Fout(400, 'Ongeldige planeet');
   }
   let groep = l.groep_id;
-  if (body.groep_id !== undefined) groep = mijnGroep(lk, body.groep_id).id;
-  db.prepare('UPDATE leerlingen SET naam = ?, planeet = ?, herhaling = ?, groep_id = ? WHERE id = ?').run(naam, planeet, herhaling, groep, l.id);
+  if (body.groep_id !== undefined) groep = (await mijnGroep(lk, body.groep_id)).id;
+  await db.run('UPDATE leerlingen SET naam = ?, planeet = ?, herhaling = ?, groep_id = ? WHERE id = ?', naam, planeet, herhaling, groep, l.id);
   return { ok: true };
 });
-route('POST', '/api/lk/leerlingen/:id/nieuw-wachtwoord', 'leerkracht', ({ lk, params }) => {
-  const l = mijnLeerling(lk, params.id);
+route('POST', '/api/lk/leerlingen/:id/nieuw-wachtwoord', 'leerkracht', async ({ lk, params }) => {
+  const l = await mijnLeerling(lk, params.id);
   const wachtwoord = maakWachtwoord();
-  db.prepare('UPDATE leerlingen SET wachtwoord = ? WHERE id = ?').run(wachtwoord, l.id);
-  db.prepare("DELETE FROM sessies WHERE soort = 'leerling' AND gebruiker_id = ?").run(l.id);
+  await db.run('UPDATE leerlingen SET wachtwoord = ? WHERE id = ?', wachtwoord, l.id);
+  await db.run("DELETE FROM sessies WHERE soort = 'leerling' AND gebruiker_id = ?", l.id);
   return { wachtwoord };
 });
-route('DELETE', '/api/lk/leerlingen/:id', 'leerkracht', ({ lk, params }) => {
-  const l = mijnLeerling(lk, params.id);
-  db.prepare('DELETE FROM leerlingen WHERE id = ?').run(l.id);
-  db.prepare("DELETE FROM sessies WHERE soort = 'leerling' AND gebruiker_id = ?").run(l.id);
+route('DELETE', '/api/lk/leerlingen/:id', 'leerkracht', async ({ lk, params }) => {
+  const l = await mijnLeerling(lk, params.id);
+  await verwijderLeerling(l.id);
   return { ok: true };
 });
 
@@ -524,44 +550,43 @@ function alleenBeheerder(lk) { if (!lk.beheerder) throw new Fout(403, 'Alleen de
 const CODETEKENS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const maakCode = () => 'SV-' + Array.from({ length: 6 }, () => CODETEKENS[crypto.randomInt(CODETEKENS.length)]).join('');
 
-route('GET', '/api/lk/collegas', 'leerkracht', ({ lk }) => {
+route('GET', '/api/lk/collegas', 'leerkracht', async ({ lk }) => {
   alleenBeheerder(lk);
   return {
-    collegas: db.prepare(`SELECT k.id, k.naam, k.email, k.beheerder, k.gemaakt, COUNT(g.id) AS groepen
-      FROM leerkrachten k LEFT JOIN groepen g ON g.leerkracht_id = k.id GROUP BY k.id ORDER BY k.naam`).all()
+    collegas: (await db.all(`SELECT k.id, k.naam, k.email, k.beheerder, k.gemaakt, COUNT(g.id) AS groepen
+      FROM leerkrachten k LEFT JOIN groepen g ON g.leerkracht_id = k.id GROUP BY k.id ORDER BY k.naam`))
       .map(k => ({ ...k, beheerder: !!k.beheerder, ik: k.id === lk.id })),
-    uitnodigingen: db.prepare('SELECT code, naam, verloopt FROM uitnodigingen WHERE gebruikt_door IS NULL AND verloopt > ? ORDER BY gemaakt DESC').all(nu())
+    uitnodigingen: await db.all('SELECT code, naam, verloopt FROM uitnodigingen WHERE gebruikt_door IS NULL AND verloopt > ? ORDER BY gemaakt DESC', nu())
   };
 });
-route('POST', '/api/lk/uitnodigingen', 'leerkracht', ({ lk, body }) => {
+route('POST', '/api/lk/uitnodigingen', 'leerkracht', async ({ lk, body }) => {
   alleenBeheerder(lk);
   const code = maakCode();
   const verloopt = new Date(Date.now() + 14 * 24 * 3600_000).toISOString();
-  db.prepare('INSERT INTO uitnodigingen (code, gemaakt_door, naam, verloopt) VALUES (?, ?, ?, ?)').run(code, lk.id, String(body.naam || '').trim().slice(0, 60), verloopt);
+  await db.run('INSERT INTO uitnodigingen (code, gemaakt_door, naam, verloopt) VALUES (?, ?, ?, ?)', code, lk.id, String(body.naam || '').trim().slice(0, 60), verloopt);
   return { code, verloopt };
 });
-route('DELETE', '/api/lk/uitnodigingen/:code', 'leerkracht', ({ lk, params }) => {
+route('DELETE', '/api/lk/uitnodigingen/:code', 'leerkracht', async ({ lk, params }) => {
   alleenBeheerder(lk);
-  db.prepare('DELETE FROM uitnodigingen WHERE code = ?').run(params.code);
+  await db.run('DELETE FROM uitnodigingen WHERE code = ?', params.code);
   return { ok: true };
 });
-route('PATCH', '/api/lk/collegas/:id', 'leerkracht', ({ lk, body, params }) => {
+route('PATCH', '/api/lk/collegas/:id', 'leerkracht', async ({ lk, body, params }) => {
   alleenBeheerder(lk);
   const id = Number(params.id);
   if (id === lk.id) throw new Fout(400, 'Je kunt je eigen beheerdersrol niet weghalen.');
-  db.prepare('UPDATE leerkrachten SET beheerder = ? WHERE id = ?').run(body.beheerder ? 1 : 0, id);
+  await db.run('UPDATE leerkrachten SET beheerder = ? WHERE id = ?', body.beheerder ? 1 : 0, id);
   return { ok: true };
 });
-route('DELETE', '/api/lk/collegas/:id', 'leerkracht', ({ lk, params }) => {
+route('DELETE', '/api/lk/collegas/:id', 'leerkracht', async ({ lk, params }) => {
   alleenBeheerder(lk);
   const id = Number(params.id);
   if (id === lk.id) throw new Fout(400, 'Je kunt je eigen account niet verwijderen.');
-  db.prepare('DELETE FROM leerkrachten WHERE id = ?').run(id); // groepen en leerlingen gaan mee
-  db.prepare("DELETE FROM sessies WHERE soort = 'leerkracht' AND gebruiker_id = ?").run(id);
+  await verwijderLeerkracht(id); // groepen en leerlingen gaan mee
   return { ok: true };
 });
 
-route('GET', '/api/lk/leerdoelen', 'leerkracht', () => ({
+route('GET', '/api/lk/leerdoelen', 'leerkracht', async () => ({
   planeten: PLANETEN.map((p, i) => ({ ...p, vragen: PER_PLANEET[i] }))
 }));
 
@@ -599,17 +624,22 @@ const server = http.createServer(async (req, res) => {
     if (req.method !== 'GET' && !String(req.headers['content-type']).startsWith('application/json')) throw new Fout(415, 'Verwacht JSON');
     const ctx = { req, res, params: gevonden.params, query: Object.fromEntries(url.searchParams), body: req.method === 'GET' ? {} : await leesBody(req) };
     if (gevonden.r.rol) {
-      const s = sessie(req);
+      const s = await sessie(req);
       if (!s || s.soort !== gevonden.r.rol) throw new Fout(401, 'Log eerst in.');
-      if (s.soort === 'leerling') ctx.l = db.prepare('SELECT * FROM leerlingen WHERE id = ?').get(s.gebruiker_id);
-      else ctx.lk = db.prepare('SELECT * FROM leerkrachten WHERE id = ?').get(s.gebruiker_id);
+      if (s.soort === 'leerling') ctx.l = await db.get('SELECT * FROM leerlingen WHERE id = ?', s.gebruiker_id);
+      else ctx.lk = await db.get('SELECT * FROM leerkrachten WHERE id = ?', s.gebruiker_id);
       if (!ctx.l && !ctx.lk) throw new Fout(401, 'Log eerst in.');
     }
-    stuur(200, gevonden.r.fn(ctx));
+    stuur(200, await gevonden.r.fn(ctx));
   } catch (e) {
     if (!e.status) console.error(e);
     stuur(e.status || 500, { fout: e.status ? e.message : 'Er ging iets mis op de server.' });
   }
 });
 
-server.listen(PORT, () => console.log(`🚀 SpaceVerbs draait op http://localhost:${PORT}`));
+db.klaar.then(() => {
+  server.listen(PORT, () => console.log(`🚀 SpaceVerbs draait op http://localhost:${PORT} (database: ${db.soort})`));
+  if (db.soort === 'lokaal' && process.env.RENDER) {
+    console.warn('⚠️  Let op: geen TURSO_DATABASE_URL ingesteld. Op Render Free gaan alle gegevens verloren bij een herstart!');
+  }
+}).catch(e => { console.error('Database kon niet starten:', e.message); process.exit(1); });

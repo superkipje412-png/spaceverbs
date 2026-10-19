@@ -34,7 +34,7 @@ De fouten worden automatisch ingedeeld in soorten: *t vergeten*, *t te veel*, *d
 
 ## Starten
 
-Je hebt alleen **Node.js 22.13 of nieuwer** nodig. Er zijn geen extra pakketten nodig.
+Je hebt alleen **Node.js 22.13 of nieuwer** nodig. Voor gebruik op je eigen computer zijn geen extra pakketten nodig. Alleen voor de online database (Turso) is `npm install` nodig.
 
 ```bash
 npm start
@@ -49,13 +49,29 @@ Instellingen via omgevingsvariabelen:
 | `PORT` | `3000` | Poort van de webserver |
 | `DATA_DIR` | `./data` | Map voor de database |
 | `DB_PATH` | `./data/spaceverbs.db` | Exacte plek van de database |
+| `TURSO_DATABASE_URL` | – | Adres van een Turso-database (online, zie hieronder) |
+| `TURSO_AUTH_TOKEN` | – | Token voor die Turso-database |
 
-## Online zetten
+## Online zetten (gratis)
 
-SpaceVerbs is één Node.js-server met een SQLite-database in één bestand. Het draait op elke host die Node.js 22 ondersteunt, zoals Render, Railway, Fly.io, een VPS of een server van school. Let hierbij op twee dingen:
+SpaceVerbs kan gratis online met twee diensten:
 
-1. Zorg dat de map met de database (`DATA_DIR`) op een **blijvende schijf** staat, anders is de voortgang weg na een herstart.
-2. Gebruik **https** (bij de meeste hosts gaat dat automatisch).
+- **Render** (gratis web service) draait de website.
+- **Turso** (gratis database) bewaart alle accounts en voortgang. Dit is nodig omdat de gratis server van Render geen blijvende schijf heeft.
+
+Stappen:
+
+1. Maak bij **turso.tech** een database aan (kies een Europese locatie) en maak een token aan. Je krijgt een adres (`libsql://...`) en een lange token.
+2. Maak bij **render.com** een **Web Service** van deze GitHub-repository met:
+   - Build Command: `npm install`
+   - Start Command: `npm start`
+   - Instance Type: **Free**
+   - Environment Variables: `NODE_VERSION` = `22`, `TURSO_DATABASE_URL` = het adres, `TURSO_AUTH_TOKEN` = de token
+3. Open het adres dat Render geeft en maak meteen het eerste leerkracht-account aan (dat wordt de beheerder).
+
+Let op: de gratis server gaat slapen als er 15 minuten niemand op de site is. De eerste bezoeker daarna wacht ongeveer een minuut. Open de site dus even voor de les begint.
+
+Zonder `TURSO_DATABASE_URL` gebruikt SpaceVerbs een lokaal databasebestand in `data/` (of `DATA_DIR`). Dat is handig op je eigen computer of op een server met een blijvende schijf.
 
 ## Vragen aanpassen
 

@@ -1,9 +1,10 @@
-# Instellingen voor Render.com (New → Blueprint). De database staat op een blijvende schijf.
+# Instellingen voor Render.com (gratis versie). De gegevens staan in een gratis Turso-database,
+# omdat de gratis Render-server geen blijvende schijf heeft.
 services:
   - type: web
     name: spaceverbs
     runtime: node
-    plan: starter
+    plan: free
     region: frankfurt
     buildCommand: npm install
     startCommand: npm start
@@ -11,9 +12,7 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "22"
-      - key: DATA_DIR
-        value: /var/data
-    disk:
-      name: spaceverbs-data
-      mountPath: /var/data
-      sizeGB: 1
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false

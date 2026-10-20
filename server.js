@@ -4,6 +4,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
 
 const db = require('./lib/db');
 const { PLANETEN } = require('./lib/planeten');
@@ -161,6 +162,21 @@ async function telTijd(l, sec) {
   await db.run('UPDATE groepen SET dierentuin_sec = dierentuin_sec + ? WHERE id = ?', sec, groep.id);
   const na = dierentuin({ ...groep, dierentuin_sec: groep.dierentuin_sec + sec }).ontgrendeld;
   return na > voor ? SPEL.DIEREN[na - 1] : null;
+}
+
+// Adressen van deze computer op het netwerk (wifi/kabel), zodat leerlingen in hetzelfde netwerk kunnen meedoen
+function netwerkLinks() {
+  const uit = [];
+  for (const [naam, lijst] of Object.entries(os.networkInterfaces())) {
+    for (const a of lijst || []) {
+      if (a.family !== 'IPv4' && a.family !== 4) continue;
+      if (a.internal || a.address.startsWith('169.254.')) continue;
+      // virtuele netwerkkaarten (VirtualBox, Docker, WSL) achteraan
+      const virtueel = /vbox|virtual|docker|vethernet|wsl|vmware|utun|bridge/i.test(naam);
+      uit.push({ link: `http://${a.address}:${PORT}`, virtueel });
+    }
+  }
+  return uit.sort((a, b) => a.virtueel - b.virtueel).map(a => a.link);
 }
 
 // ---------- verwijderen ----------
@@ -586,6 +602,8 @@ route('DELETE', '/api/lk/collegas/:id', 'leerkracht', async ({ lk, params }) => 
   return { ok: true };
 });
 
+route('GET', '/api/lk/netwerk', 'leerkracht', async () => ({ links: netwerkLinks() }));
+
 route('GET', '/api/lk/leerdoelen', 'leerkracht', async () => ({
   planeten: PLANETEN.map((p, i) => ({ ...p, vragen: PER_PLANEET[i] }))
 }));
@@ -638,7 +656,17 @@ const server = http.createServer(async (req, res) => {
 });
 
 db.klaar.then(() => {
-  server.listen(PORT, () => console.log(`🚀 SpaceVerbs draait op http://localhost:${PORT} (database: ${db.soort})`));
+  server.listen(PORT, () => {
+    console.log(`🚀 SpaceVerbs draait op http://localhost:${PORT} (database: ${db.soort})`);
+    const links = netwerkLinks();
+    if (db.soort === 'lokaal' && links.length) {
+      console.log('');
+      console.log('👉 Link voor leerlingen op hetzelfde wifi-netwerk:');
+      for (const l of links) console.log('     ' + l);
+      console.log('');
+      console.log('   Laat dit venster open zolang de leerlingen oefenen.');
+    }
+  });
   if (db.soort === 'lokaal' && process.env.RENDER) {
     console.warn('⚠️  Let op: geen TURSO_DATABASE_URL ingesteld. Op Render Free gaan alle gegevens verloren bij een herstart!');
   }

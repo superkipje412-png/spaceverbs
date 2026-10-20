@@ -652,6 +652,13 @@ function koppelLk() { const u = app.querySelector('#uit'); if (u) u.onclick = e 
 const PLANEETNAMEN = ['Aarde', 'Maan', 'Mars', 'Venus', 'Jupiter', 'Saturnus', 'Uranus', 'Neptunus', 'Pluto'];
 const planeetLabel = (p, h = null) => h !== null && h !== undefined ? `<span class="pill geel">⭐ Herhaling na ${PLANEETNAMEN[h]}</span>`
   : p >= PLANEETNAMEN.length ? '<span class="pill groen">Alles gehaald 🏆</span>' : `<span class="pill">${p + 1}. ${PLANEETNAMEN[p]}</span>`;
+// De link die leerlingen gebruiken. Draait SpaceVerbs op deze computer (localhost), dan is dat het netwerkadres.
+let leerlingLinkCache = null;
+async function leerlingLink() {
+  if (!['localhost', '127.0.0.1', '::1', '[::1]'].includes(location.hostname)) return location.origin;
+  if (!leerlingLinkCache) leerlingLinkCache = (await api('GET', '/api/lk/netwerk')).links;
+  return leerlingLinkCache[0] || location.origin;
+}
 const tijdstip = iso => new Date(iso).toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' });
 function wanneer(iso) {
   if (!iso) return '<span class="zacht">nog nooit</span>';
@@ -669,9 +676,15 @@ function staven(rijen) {
 }
 
 async function lkGroepen() {
-  const d = await api('GET', '/api/lk/groepen');
+  const [d, link] = await Promise.all([api('GET', '/api/lk/groepen'), leerlingLink()]);
   app.innerHTML = kopLk('groepen') + `<div class="wrap">
     <h1 style="margin-top:12px">Hallo ${esc(d.leerkracht.naam)} 👋</h1>
+    <div class="kaart link-kaart">
+      <span class="zacht">📱 Link voor leerlingen</span>
+      <div class="grote-link">${esc(link.replace(/^https?:\/\//, ''))}</div>
+      ${link.startsWith('http://') && !link.includes('localhost') && /\d+\.\d+\.\d+\.\d+/.test(link)
+        ? '<small class="zacht">Dit adres werkt alleen voor apparaten op <b>hetzelfde wifi-netwerk</b> als deze computer, en alleen zolang SpaceVerbs hier draait.</small>' : ''}
+    </div>
     <p class="zacht">Kies een groep om de voortgang van je leerlingen te bekijken, of maak een nieuwe groep aan.</p>
     <div class="groepen-raster">
       ${d.groepen.map(g => `<a class="kaart groep-kaart" href="#/groep/${g.id}">
@@ -809,17 +822,17 @@ async function lkGroep(id, melding = '') {
 }
 
 async function lkKaartjes(id) {
-  const d = await api('GET', '/api/lk/groepen/' + id);
+  const [d, link] = await Promise.all([api('GET', '/api/lk/groepen/' + id), leerlingLink()]);
   app.innerHTML = kopLk('groepen') + `<div class="wrap">
     <div class="rij tussen niet-printen" style="margin:12px 0">
       <div><a href="#/groep/${id}" class="zacht">← ${esc(d.groep.naam)}</a><h1>Inlogkaartjes</h1></div>
       <button class="knop" onclick="window.print()">🖨️ Printen</button>
     </div>
-    <p class="zacht niet-printen">Knip de kaartjes uit en geef elke leerling zijn of haar eigen kaartje. Inloggen kan op: <b>${esc(location.origin)}</b></p>
+    <p class="zacht niet-printen">Knip de kaartjes uit en geef elke leerling zijn of haar eigen kaartje. Inloggen kan op: <b>${esc(link)}</b></p>
     <div class="kaartjes">${d.leerlingen.map(l => `<div class="kaartje">
       ${blobSVG(l.blob || { kleur: '#a855f7', ogen: 2 }, 64)}
       <div><div class="k-logo">${logo()}</div><b>${esc(l.naam)}</b>
-      <dl><dt>Naam:</dt><dd>${esc(l.gebruikersnaam)}</dd><dt>Wachtwoord:</dt><dd>${esc(l.wachtwoord)}</dd></dl></div>
+      <dl><dt>Website:</dt><dd>${esc(link.replace(/^https?:\/\//, ''))}</dd><dt>Naam:</dt><dd>${esc(l.gebruikersnaam)}</dd><dt>Wachtwoord:</dt><dd>${esc(l.wachtwoord)}</dd></dl></div>
     </div>`).join('') || '<p class="leeg">Nog geen leerlingen in deze groep.</p>'}</div>
   </div>`;
   koppelLk();
